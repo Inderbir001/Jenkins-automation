@@ -14,28 +14,47 @@ app.get("/", (req, res) => {
   res.send("🚀 Slack → Jenkins Trigger is running");
 });
 
-// 🔁 Get latest build status
-async function getBuildStatus(jobName) {
-  const res = await axios.get(
-    `${JENKINS_URL}/job/${jobName}/lastBuild/api/json`,
-    {
+// ⏳ Get build number from queue
+async function getBuildNumber(queueUrl) {
+  let buildNumber = null;
+
+  while (!buildNumber) {
+    await new Promise((r) => setTimeout(r, 3000));
+
+    const res = await axios.get(`${queueUrl}api/json`, {
       auth: {
         username: USERNAME,
         password: API_TOKEN,
       },
+    });
+
+    if (res.data.executable) {
+      buildNumber = res.data.executable.number;
     }
-  );
-  return res.data;
+  }
+
+  return buildNumber;
 }
 
-// ⏳ Wait until build completes
-async function waitForBuild(jobName) {
+// ⏳ Wait for specific build
+async function waitForBuild(jobName, buildNumber) {
   let building = true;
   let data;
 
   while (building) {
-    await new Promise((r) => setTimeout(r, 5000)); // wait 5 sec
-    data = await getBuildStatus(jobName);
+    await new Promise((r) => setTimeout(r, 5000));
+
+    const res = await axios.get(
+      `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
+      {
+        auth: {
+          username: USERNAME,
+          password: API_TOKEN,
+        },
+      }
+    );
+
+    data = res.data;
     building = data.building;
   }
 
@@ -49,10 +68,10 @@ app.post("/slack-trigger", async (req, res) => {
   const responseUrl = req.body.response_url;
 
   try {
-    // ✅ Respond immediately to Slack (VERY IMPORTANT)
+    // ✅ Immediate response
     res.send(`🚀 Triggering Jenkins job: ${rawJobName}...`);
 
-    // 🔐 Step 1: Get CSRF crumb
+    // 🔐 Get crumb
     const crumbRes = await axios.get(`${JENKINS_URL}/crumbIssuer/api/json`, {
       auth: {
         username: USERNAME,
@@ -63,8 +82,8 @@ app.post("/slack-trigger", async (req, res) => {
     const crumb = crumbRes.data.crumb;
     const crumbField = crumbRes.data.crumbRequestField;
 
-    // 🚀 Step 2: Trigger job
-    await axios.post(
+    // 🚀 Trigger job
+    const triggerRes = await axios.post(
       `${JENKINS_URL}/job/${jobName}/build`,
       {},
       {
@@ -75,25 +94,33 @@ app.post("/slack-trigger", async (req, res) => {
         headers: {
           [crumbField]: crumb,
         },
+        maxRedirects: 0,
+        validateStatus: (status) => status === 201,
       }
     );
 
-    // ⏳ Step 3: Wait for build result
-    const result = await waitForBuild(jobName);
+    // 📌 Get queue URL
+    const queueUrl = triggerRes.headers.location;
+
+    // ⏳ Get actual build number
+    const buildNumber = await getBuildNumber(queueUrl);
+
+    // ⏳ Wait for build result
+    const result = await waitForBuild(jobName, buildNumber);
 
     // 📊 Format message
     const durationSec = (result.duration / 1000).toFixed(2);
-    const buildUrl = `${JENKINS_URL}/job/${jobName}/${result.number}`;
+    const buildUrl = `${JENKINS_URL}/job/${jobName}/${buildNumber}`;
 
     let message = "";
 
     if (result.result === "SUCCESS") {
-      message = `✅ *Build Success*\nJob: ${rawJobName}\nDuration: ${durationSec}s\n🔗 ${buildUrl}`;
+      message = `✅ *Build Success*\nJob: ${rawJobName}\nBuild: #${buildNumber}\nDuration: ${durationSec}s\n🔗 ${buildUrl}`;
     } else {
-      message = `❌ *Build Failed*\nJob: ${rawJobName}\n🔗 ${buildUrl}`;
+      message = `❌ *Build Failed*\nJob: ${rawJobName}\nBuild: #${buildNumber}\n🔗 ${buildUrl}`;
     }
 
-    // 📤 Step 4: Send result back to Slack
+    // 📤 Send to Slack
     await axios.post(responseUrl, {
       text: message,
     });
@@ -109,7 +136,7 @@ app.post("/slack-trigger", async (req, res) => {
   }
 });
 
-// ✅ Dynamic port (Render)
+// ✅ Dynamic port
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
