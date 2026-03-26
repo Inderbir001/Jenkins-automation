@@ -14,7 +14,45 @@ app.get("/", (req, res) => {
   res.send("🚀 Slack → Jenkins Trigger is running");
 });
 
-// ⏳ Get build number from queue
+// 🧠 Extract summary
+function extractSummary(logText) {
+  const passed = logText.match(/(\d+)\s+passed/)?.[1] || 0;
+  const failed = logText.match(/(\d+)\s+failed/)?.[1] || 0;
+  const skipped = logText.match(/(\d+)\s+skipped/)?.[1] || 0;
+
+  return { passed, failed, skipped };
+}
+
+// ❌ Extract failed test names (top 10)
+function extractFailedTests(logText) {
+  const failedTests = [];
+
+  const lines = logText.split("\n");
+
+  for (let line of lines) {
+    if (line.includes("❌") || line.includes("failed")) {
+      failedTests.push(line.trim());
+    }
+  }
+
+  return failedTests.slice(0, 10); // limit
+}
+
+// 📜 Get console logs
+async function getConsoleOutput(jobName, buildNumber) {
+  const res = await axios.get(
+    `${JENKINS_URL}/job/${jobName}/${buildNumber}/consoleText`,
+    {
+      auth: {
+        username: USERNAME,
+        password: API_TOKEN,
+      },
+    },
+  );
+  return res.data;
+}
+
+// ⏳ Get build number
 async function getBuildNumber(queueUrl) {
   let buildNumber = null;
 
@@ -36,7 +74,7 @@ async function getBuildNumber(queueUrl) {
   return buildNumber;
 }
 
-// ⏳ Wait for specific build
+// ⏳ Wait for build completion
 async function waitForBuild(jobName, buildNumber) {
   let building = true;
   let data;
@@ -51,7 +89,7 @@ async function waitForBuild(jobName, buildNumber) {
           username: USERNAME,
           password: API_TOKEN,
         },
-      }
+      },
     );
 
     data = res.data;
@@ -61,14 +99,14 @@ async function waitForBuild(jobName, buildNumber) {
   return data;
 }
 
-// 🚀 Slack trigger route
+// 🚀 MAIN ROUTE
 app.post("/slack-trigger", async (req, res) => {
   const rawJobName = req.body.text || "MCSL Pipeline";
   const jobName = encodeURIComponent(rawJobName);
   const responseUrl = req.body.response_url;
 
   try {
-    // ✅ Immediate response
+    // ⚡ Immediate response
     res.send(`🚀 Triggering Jenkins job: ${rawJobName}...`);
 
     // 🔐 Get crumb
@@ -82,7 +120,7 @@ app.post("/slack-trigger", async (req, res) => {
     const crumb = crumbRes.data.crumb;
     const crumbField = crumbRes.data.crumbRequestField;
 
-    // 🚀 Trigger job
+    // 🚀 Trigger build
     const triggerRes = await axios.post(
       `${JENKINS_URL}/job/${jobName}/build`,
       {},
@@ -96,35 +134,58 @@ app.post("/slack-trigger", async (req, res) => {
         },
         maxRedirects: 0,
         validateStatus: (status) => status === 201,
-      }
+      },
     );
 
-    // 📌 Get queue URL
+    // 📌 Queue URL
     const queueUrl = triggerRes.headers.location;
 
-    // ⏳ Get actual build number
+    // 🔢 Build number
     const buildNumber = await getBuildNumber(queueUrl);
 
-    // ⏳ Wait for build result
+    // ⏳ Wait for completion
     const result = await waitForBuild(jobName, buildNumber);
 
-    // 📊 Format message
+    // 📜 Logs
+    const consoleText = await getConsoleOutput(jobName, buildNumber);
+
+    // 📊 Summary
+    const summary = extractSummary(consoleText);
+
+    // ❌ Failed tests
+    const failedTests = extractFailedTests(consoleText);
+
     const durationSec = (result.duration / 1000).toFixed(2);
     const buildUrl = `${JENKINS_URL}/job/${jobName}/${buildNumber}`;
 
-    let message = "";
+    // 🎯 Build message
+    let message = `
+${result.result === "SUCCESS" ? "✅" : "❌"} *Build ${result.result}*
+*Job:* ${rawJobName}
+*Build:* #${buildNumber}
+*Duration:* ${durationSec}s
 
-    if (result.result === "SUCCESS") {
-      message = `✅ *Build Success*\nJob: ${rawJobName}\nBuild: #${buildNumber}\nDuration: ${durationSec}s\n🔗 ${buildUrl}`;
-    } else {
-      message = `❌ *Build Failed*\nJob: ${rawJobName}\nBuild: #${buildNumber}\n🔗 ${buildUrl}`;
+📊 *Test Summary*
+✔ Passed: ${summary.passed}
+❌ Failed: ${summary.failed}
+⚠ Skipped: ${summary.skipped}
+`;
+
+    // 🔥 Add failed tests (if any)
+    if (failedTests.length > 0) {
+      message += `\n❌ *Failed Tests (Top ${failedTests.length})*\n`;
+      failedTests.forEach((t, i) => {
+        message += `${i + 1}. ${t}\n`;
+      });
     }
+
+    // 🔗 Add links
+    message += `\n🔗 ${buildUrl}`;
 
     // 📤 Send to Slack
     await axios.post(responseUrl, {
       text: message,
     });
-
   } catch (err) {
     console.error("FULL ERROR:", err.response?.data || err.message);
 
