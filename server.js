@@ -1,19 +1,25 @@
 const express = require("express");
 const axios = require("axios");
-const app = express();
 
+const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-const JENKINS_URL = "http://localhost:8080";
-const USERNAME = process.env.USERNAME;
-const API_TOKEN = process.env.API_TOKEN;
+// ✅ Use ENV variables (Render friendly)
+const JENKINS_URL = process.env.JENKINS_URL;
+const USERNAME = process.env.JENKINS_USER;
+const API_TOKEN = process.env.JENKINS_TOKEN;
+
+// 🔍 Health check route (optional but useful)
+app.get("/", (req, res) => {
+  res.send("🚀 Slack → Jenkins Trigger is running");
+});
 
 app.post("/slack-trigger", async (req, res) => {
   const rawJobName = req.body.text || "MCSL Pipeline";
   const jobName = encodeURIComponent(rawJobName);
 
   try {
-    // 🔐 Step 1: Get crumb
+    // 🔐 Step 1: Get CSRF crumb
     const crumbRes = await axios.get(`${JENKINS_URL}/crumbIssuer/api/json`, {
       auth: {
         username: USERNAME,
@@ -24,6 +30,7 @@ app.post("/slack-trigger", async (req, res) => {
     const crumb = crumbRes.data.crumb;
     const crumbField = crumbRes.data.crumbRequestField;
 
+    // 🚀 Step 2: Trigger Jenkins job
     await axios.post(
       `${JENKINS_URL}/job/${jobName}/build`,
       {},
@@ -38,13 +45,16 @@ app.post("/slack-trigger", async (req, res) => {
       },
     );
 
-    res.send(`✅ Jenkins job triggered: ${rawJobName}`);
+    return res.send(`✅ Jenkins job triggered: ${rawJobName}`);
   } catch (err) {
-    console.error("Error:", err.response?.data || err.message);
-    res.send(`❌ Failed to trigger Jenkins`);
+    console.error("FULL ERROR:", err.response?.data || err.message);
+    return res.status(500).send("❌ Failed to trigger Jenkins");
   }
 });
 
-app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
+// ✅ Use dynamic port (REQUIRED for Render)
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
