@@ -1,47 +1,31 @@
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
+const FormData = require("form-data");
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// ENV
 const JENKINS_URL = process.env.JENKINS_URL;
 const USERNAME = process.env.JENKINS_USER;
 const API_TOKEN = process.env.JENKINS_TOKEN;
 
-// Health
-app.get("/", (req, res) => {
-  res.send("🚀 Slack → Jenkins Trigger is running");
-});
+// 🔥 REQUIRED for file upload
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const SLACK_CHANNEL = process.env.SLACK_CHANNEL;
 
-// 📊 Summary extraction
+// Summary
 function extractSummary(logText) {
   const passed = logText.match(/(\d+)\s+passed/)?.[1] || 0;
   const failed = logText.match(/(\d+)\s+failed/)?.[1] || 0;
   const skipped = logText.match(/(\d+)\s+skipped/)?.[1] || 0;
-
   return { passed, failed, skipped };
 }
 
-// ❌ Failed tests (optional)
-function extractFailedTests(logText) {
-  const failedTests = [];
-  const lines = logText.split("\n");
-
-  for (let line of lines) {
-    if (line.includes("❌") || line.includes("failed")) {
-      failedTests.push(line.trim());
-    }
-  }
-
-  return failedTests.slice(0, 10);
-}
-
-// 🔥 Extract Playwright-style steps
+// Steps
 function extractTestSteps(logText) {
   const lines = logText.split("\n");
   const steps = [];
-
   let index = 1;
 
   for (let line of lines) {
@@ -59,21 +43,18 @@ function extractTestSteps(logText) {
   return steps;
 }
 
-// 📜 Get logs
+// Logs
 async function getConsoleOutput(jobName, buildNumber) {
   const res = await axios.get(
     `${JENKINS_URL}/job/${jobName}/${buildNumber}/consoleText`,
     {
-      auth: {
-        username: USERNAME,
-        password: API_TOKEN,
-      },
+      auth: { username: USERNAME, password: API_TOKEN },
     },
   );
   return res.data;
 }
 
-// 🔢 Get build number
+// Build number
 async function getBuildNumber(queueUrl) {
   let buildNumber = null;
 
@@ -81,10 +62,7 @@ async function getBuildNumber(queueUrl) {
     await new Promise((r) => setTimeout(r, 3000));
 
     const res = await axios.get(`${queueUrl}api/json`, {
-      auth: {
-        username: USERNAME,
-        password: API_TOKEN,
-      },
+      auth: { username: USERNAME, password: API_TOKEN },
     });
 
     if (res.data.executable) {
@@ -95,7 +73,7 @@ async function getBuildNumber(queueUrl) {
   return buildNumber;
 }
 
-// ⏳ Wait for build
+// Wait build
 async function waitForBuild(jobName, buildNumber) {
   let building = true;
   let data;
@@ -106,10 +84,7 @@ async function waitForBuild(jobName, buildNumber) {
     const res = await axios.get(
       `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
       {
-        auth: {
-          username: USERNAME,
-          password: API_TOKEN,
-        },
+        auth: { username: USERNAME, password: API_TOKEN },
       },
     );
 
@@ -120,7 +95,27 @@ async function waitForBuild(jobName, buildNumber) {
   return data;
 }
 
-// 🚀 MAIN ROUTE
+// 🔥 Upload logs to Slack
+async function uploadLogsToSlack(logText, buildNumber) {
+  fs.writeFileSync("build.log", logText);
+
+  const form = new FormData();
+  form.append("file", fs.createReadStream("build.log"));
+  form.append("channels", SLACK_CHANNEL);
+  form.append(
+    "initial_comment",
+    `📎 Full Jenkins Logs (Build #${buildNumber})`,
+  );
+
+  await axios.post("https://slack.com/api/files.upload", form, {
+    headers: {
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      ...form.getHeaders(),
+    },
+  });
+}
+
+// MAIN
 app.post("/slack-trigger", async (req, res) => {
   const rawJobName = req.body.text || "MCSL Pipeline";
   const jobName = encodeURIComponent(rawJobName);
@@ -129,7 +124,7 @@ app.post("/slack-trigger", async (req, res) => {
   try {
     res.send(`🚀 Triggering Jenkins job: ${rawJobName}...`);
 
-    // 🔐 Crumb
+    // crumb
     const crumbRes = await axios.get(`${JENKINS_URL}/crumbIssuer/api/json`, {
       auth: { username: USERNAME, password: API_TOKEN },
     });
@@ -137,7 +132,7 @@ app.post("/slack-trigger", async (req, res) => {
     const crumb = crumbRes.data.crumb;
     const crumbField = crumbRes.data.crumbRequestField;
 
-    // 🚀 Trigger build
+    // trigger
     const triggerRes = await axios.post(
       `${JENKINS_URL}/job/${jobName}/build`,
       {},
@@ -150,14 +145,9 @@ app.post("/slack-trigger", async (req, res) => {
     );
 
     const queueUrl = triggerRes.headers.location;
-
-    // 🔢 Build number
     const buildNumber = await getBuildNumber(queueUrl);
-
-    // ⏳ Wait
     const result = await waitForBuild(jobName, buildNumber);
 
-    // 📜 Logs
     const consoleText = await getConsoleOutput(jobName, buildNumber);
 
     const summary = extractSummary(consoleText);
@@ -168,7 +158,7 @@ app.post("/slack-trigger", async (req, res) => {
 
     const buildUrl = `${JENKINS_URL}/job/${jobName}/${buildNumber}`;
 
-    // 🎯 FINAL SLACK MESSAGE (YOUR FORMAT)
+    // 🔥 MESSAGE
     let message = `@here  Automation Test Report :bananadance_colors:
 
 SUMMARY :
@@ -179,16 +169,17 @@ CARRIER : ${process.env.CARRIER || "N/A"}
 Triggered BY : ${req.body.user_name || "Slack User"}
 `;
 
-    // 🔥 Steps
     steps.forEach((step) => {
       message += `${step}\n`;
     });
 
-    // 🔗 Jenkins link
     message += `\n🔗 ${buildUrl}`;
 
-    // 📤 Send
+    // Send message
     await axios.post(responseUrl, { text: message });
+
+    // 🔥 Upload FULL logs separately
+    await uploadLogsToSlack(consoleText, buildNumber);
   } catch (err) {
     console.error(err.response?.data || err.message);
 
@@ -200,8 +191,6 @@ Triggered BY : ${req.body.user_name || "Slack User"}
   }
 });
 
-// PORT
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Server running");
 });
