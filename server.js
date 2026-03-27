@@ -4,17 +4,17 @@ const axios = require("axios");
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// ✅ ENV variables
+// ENV
 const JENKINS_URL = process.env.JENKINS_URL;
 const USERNAME = process.env.JENKINS_USER;
 const API_TOKEN = process.env.JENKINS_TOKEN;
 
-// 🔍 Health check
+// Health
 app.get("/", (req, res) => {
   res.send("🚀 Slack → Jenkins Trigger is running");
 });
 
-// 🧠 Extract summary
+// 📊 Summary extraction
 function extractSummary(logText) {
   const passed = logText.match(/(\d+)\s+passed/)?.[1] || 0;
   const failed = logText.match(/(\d+)\s+failed/)?.[1] || 0;
@@ -23,10 +23,9 @@ function extractSummary(logText) {
   return { passed, failed, skipped };
 }
 
-// ❌ Extract failed test names (top 10)
+// ❌ Failed tests (optional)
 function extractFailedTests(logText) {
   const failedTests = [];
-
   const lines = logText.split("\n");
 
   for (let line of lines) {
@@ -35,10 +34,32 @@ function extractFailedTests(logText) {
     }
   }
 
-  return failedTests.slice(0, 10); // limit
+  return failedTests.slice(0, 10);
 }
 
-// 📜 Get console logs
+// 🔥 Extract Playwright-style steps
+function extractTestSteps(logText) {
+  const lines = logText.split("\n");
+  const steps = [];
+
+  let index = 1;
+
+  for (let line of lines) {
+    if (
+      line.includes("✓") ||
+      line.includes("✔") ||
+      line.includes("❌") ||
+      line.includes("✖")
+    ) {
+      steps.push(`${index}. ${line.trim()}`);
+      index++;
+    }
+  }
+
+  return steps;
+}
+
+// 📜 Get logs
 async function getConsoleOutput(jobName, buildNumber) {
   const res = await axios.get(
     `${JENKINS_URL}/job/${jobName}/${buildNumber}/consoleText`,
@@ -52,7 +73,7 @@ async function getConsoleOutput(jobName, buildNumber) {
   return res.data;
 }
 
-// ⏳ Get build number
+// 🔢 Get build number
 async function getBuildNumber(queueUrl) {
   let buildNumber = null;
 
@@ -74,7 +95,7 @@ async function getBuildNumber(queueUrl) {
   return buildNumber;
 }
 
-// ⏳ Wait for build completion
+// ⏳ Wait for build
 async function waitForBuild(jobName, buildNumber) {
   let building = true;
   let data;
@@ -106,15 +127,11 @@ app.post("/slack-trigger", async (req, res) => {
   const responseUrl = req.body.response_url;
 
   try {
-    // ⚡ Immediate response
     res.send(`🚀 Triggering Jenkins job: ${rawJobName}...`);
 
-    // 🔐 Get crumb
+    // 🔐 Crumb
     const crumbRes = await axios.get(`${JENKINS_URL}/crumbIssuer/api/json`, {
-      auth: {
-        username: USERNAME,
-        password: API_TOKEN,
-      },
+      auth: { username: USERNAME, password: API_TOKEN },
     });
 
     const crumb = crumbRes.data.crumb;
@@ -125,69 +142,55 @@ app.post("/slack-trigger", async (req, res) => {
       `${JENKINS_URL}/job/${jobName}/build`,
       {},
       {
-        auth: {
-          username: USERNAME,
-          password: API_TOKEN,
-        },
-        headers: {
-          [crumbField]: crumb,
-        },
+        auth: { username: USERNAME, password: API_TOKEN },
+        headers: { [crumbField]: crumb },
         maxRedirects: 0,
         validateStatus: (status) => status === 201,
       },
     );
 
-    // 📌 Queue URL
     const queueUrl = triggerRes.headers.location;
 
     // 🔢 Build number
     const buildNumber = await getBuildNumber(queueUrl);
 
-    // ⏳ Wait for completion
+    // ⏳ Wait
     const result = await waitForBuild(jobName, buildNumber);
 
     // 📜 Logs
     const consoleText = await getConsoleOutput(jobName, buildNumber);
 
-    // 📊 Summary
     const summary = extractSummary(consoleText);
+    const steps = extractTestSteps(consoleText);
 
-    // ❌ Failed tests
-    const failedTests = extractFailedTests(consoleText);
+    const total =
+      Number(summary.passed) + Number(summary.failed) + Number(summary.skipped);
 
-    const durationSec = (result.duration / 1000).toFixed(2);
     const buildUrl = `${JENKINS_URL}/job/${jobName}/${buildNumber}`;
 
-    // 🎯 Build message
-    let message = `
-${result.result === "SUCCESS" ? "✅" : "❌"} *Build ${result.result}*
-*Job:* ${rawJobName}
-*Build:* #${buildNumber}
-*Duration:* ${durationSec}s
+    // 🎯 FINAL SLACK MESSAGE (YOUR FORMAT)
+    let message = `@here  Automation Test Report :bananadance_colors:
 
-📊 *Test Summary*
-✔ Passed: ${summary.passed}
-❌ Failed: ${summary.failed}
-⚠ Skipped: ${summary.skipped}
+SUMMARY :
+:white_check_mark: ${summary.passed} passed | :x: ${summary.failed} failed | :warning: ${summary.skipped} skipped | Total: ${total}
+
+App URL : ${process.env.APPURL || "N/A"}
+CARRIER : ${process.env.CARRIER || "N/A"}
+Triggered BY : ${req.body.user_name || "Slack User"}
 `;
 
-    // 🔥 Add failed tests (if any)
-    if (failedTests.length > 0) {
-      message += `\n❌ *Failed Tests (Top ${failedTests.length})*\n`;
-      failedTests.forEach((t, i) => {
-        message += `${i + 1}. ${t}\n`;
-      });
-    }
+    // 🔥 Steps
+    steps.forEach((step) => {
+      message += `${step}\n`;
+    });
 
-    // 🔗 Add links
+    // 🔗 Jenkins link
     message += `\n🔗 ${buildUrl}`;
 
-    // 📤 Send to Slack
-    await axios.post(responseUrl, {
-      text: message,
-    });
+    // 📤 Send
+    await axios.post(responseUrl, { text: message });
   } catch (err) {
-    console.error("FULL ERROR:", err.response?.data || err.message);
+    console.error(err.response?.data || err.message);
 
     if (req.body.response_url) {
       await axios.post(req.body.response_url, {
@@ -197,9 +200,8 @@ ${result.result === "SUCCESS" ? "✅" : "❌"} *Build ${result.result}*
   }
 });
 
-// ✅ Dynamic port
+// PORT
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
