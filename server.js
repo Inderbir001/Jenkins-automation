@@ -10,11 +10,11 @@ const JENKINS_URL = process.env.JENKINS_URL;
 const USERNAME = process.env.JENKINS_USER;
 const API_TOKEN = process.env.JENKINS_TOKEN;
 
-// 🔥 REQUIRED for file upload
+// Slack
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL = process.env.SLACK_CHANNEL;
 
-// Summary
+// 📊 Summary
 function extractSummary(logText) {
   const passed = logText.match(/(\d+)\s+passed/)?.[1] || 0;
   const failed = logText.match(/(\d+)\s+failed/)?.[1] || 0;
@@ -22,19 +22,24 @@ function extractSummary(logText) {
   return { passed, failed, skipped };
 }
 
-// Steps
+// 🔥 CLEAN TEST STEP EXTRACTION (FIXED)
 function extractTestSteps(logText) {
   const lines = logText.split("\n");
   const steps = [];
   let index = 1;
 
   for (let line of lines) {
+    // ✅ Only real Playwright test lines
     if (
-      line.includes("✓") ||
-      line.includes("✔") ||
-      line.includes("❌") ||
-      line.includes("✖")
+      (line.includes("✓") ||
+        line.includes("✔") ||
+        line.includes("❌") ||
+        line.includes("✖")) &&
+      line.includes(".ts") // 🔥 ensures only test files
     ) {
+      // 🔥 Remove timestamps like [2026-...]
+      line = line.replace(/\[.*?\]\s*/g, "");
+
       steps.push(`${index}. ${line.trim()}`);
       index++;
     }
@@ -43,18 +48,21 @@ function extractTestSteps(logText) {
   return steps;
 }
 
-// Logs
+// 📜 Get logs
 async function getConsoleOutput(jobName, buildNumber) {
   const res = await axios.get(
     `${JENKINS_URL}/job/${jobName}/${buildNumber}/consoleText`,
     {
-      auth: { username: USERNAME, password: API_TOKEN },
+      auth: {
+        username: USERNAME,
+        password: API_TOKEN,
+      },
     },
   );
   return res.data;
 }
 
-// Build number
+// 🔢 Get build number
 async function getBuildNumber(queueUrl) {
   let buildNumber = null;
 
@@ -62,7 +70,10 @@ async function getBuildNumber(queueUrl) {
     await new Promise((r) => setTimeout(r, 3000));
 
     const res = await axios.get(`${queueUrl}api/json`, {
-      auth: { username: USERNAME, password: API_TOKEN },
+      auth: {
+        username: USERNAME,
+        password: API_TOKEN,
+      },
     });
 
     if (res.data.executable) {
@@ -73,7 +84,7 @@ async function getBuildNumber(queueUrl) {
   return buildNumber;
 }
 
-// Wait build
+// ⏳ Wait for build
 async function waitForBuild(jobName, buildNumber) {
   let building = true;
   let data;
@@ -84,7 +95,10 @@ async function waitForBuild(jobName, buildNumber) {
     const res = await axios.get(
       `${JENKINS_URL}/job/${jobName}/${buildNumber}/api/json`,
       {
-        auth: { username: USERNAME, password: API_TOKEN },
+        auth: {
+          username: USERNAME,
+          password: API_TOKEN,
+        },
       },
     );
 
@@ -95,7 +109,7 @@ async function waitForBuild(jobName, buildNumber) {
   return data;
 }
 
-// 🔥 Upload logs to Slack
+// 📎 Upload FULL logs to Slack
 async function uploadLogsToSlack(logText, buildNumber) {
   fs.writeFileSync("build.log", logText);
 
@@ -115,7 +129,7 @@ async function uploadLogsToSlack(logText, buildNumber) {
   });
 }
 
-// MAIN
+// 🚀 MAIN ROUTE
 app.post("/slack-trigger", async (req, res) => {
   const rawJobName = req.body.text || "MCSL Pipeline";
   const jobName = encodeURIComponent(rawJobName);
@@ -124,30 +138,43 @@ app.post("/slack-trigger", async (req, res) => {
   try {
     res.send(`🚀 Triggering Jenkins job: ${rawJobName}...`);
 
-    // crumb
+    // 🔐 Get crumb
     const crumbRes = await axios.get(`${JENKINS_URL}/crumbIssuer/api/json`, {
-      auth: { username: USERNAME, password: API_TOKEN },
+      auth: {
+        username: USERNAME,
+        password: API_TOKEN,
+      },
     });
 
     const crumb = crumbRes.data.crumb;
     const crumbField = crumbRes.data.crumbRequestField;
 
-    // trigger
+    // 🚀 Trigger build
     const triggerRes = await axios.post(
       `${JENKINS_URL}/job/${jobName}/build`,
       {},
       {
-        auth: { username: USERNAME, password: API_TOKEN },
-        headers: { [crumbField]: crumb },
+        auth: {
+          username: USERNAME,
+          password: API_TOKEN,
+        },
+        headers: {
+          [crumbField]: crumb,
+        },
         maxRedirects: 0,
         validateStatus: (status) => status === 201,
       },
     );
 
     const queueUrl = triggerRes.headers.location;
-    const buildNumber = await getBuildNumber(queueUrl);
-    const result = await waitForBuild(jobName, buildNumber);
 
+    // 🔢 Build number
+    const buildNumber = await getBuildNumber(queueUrl);
+
+    // ⏳ Wait for completion
+    await waitForBuild(jobName, buildNumber);
+
+    // 📜 Logs
     const consoleText = await getConsoleOutput(jobName, buildNumber);
 
     const summary = extractSummary(consoleText);
@@ -158,7 +185,7 @@ app.post("/slack-trigger", async (req, res) => {
 
     const buildUrl = `${JENKINS_URL}/job/${jobName}/${buildNumber}`;
 
-    // 🔥 MESSAGE
+    // 🎯 FINAL MESSAGE
     let message = `@here  Automation Test Report :bananadance_colors:
 
 SUMMARY :
@@ -175,10 +202,10 @@ Triggered BY : ${req.body.user_name || "Slack User"}
 
     message += `\n🔗 ${buildUrl}`;
 
-    // Send message
+    // 📤 Send message
     await axios.post(responseUrl, { text: message });
 
-    // 🔥 Upload FULL logs separately
+    // 📎 Upload FULL logs
     await uploadLogsToSlack(consoleText, buildNumber);
   } catch (err) {
     console.error(err.response?.data || err.message);
@@ -191,6 +218,7 @@ Triggered BY : ${req.body.user_name || "Slack User"}
   }
 });
 
+// 🚀 Start server
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
